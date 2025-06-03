@@ -31,6 +31,12 @@
 #define LCD_MAX_ROWS 4 /* Maximum rows supported */
 #define LCD_MAX_COLS 40 /* Maximum columns per row supported */
 
+#define LCD_CMD_CLEAR 0x01 /**< Clear display command */
+#define LCD_CMD_HOME 0x02 /**< Return home command */
+
+#define LCD_SET_CURSOR_MASK 0x7F /**< Mask for setting cursor address */
+#define LCD_SET_CURSOR_CMD 0x80 /**< Command to set cursor position */
+
 static uint8_t row_addr_map[LCD_MAX_ROWS] = {
     0x00, 0x40, 0x14, 0x54
 }; /**< Row address map for HD44780 */
@@ -184,12 +190,73 @@ static void lcd_set_cursor(lcd_data_t *data, uint8_t addr)
     }
 }
 
+static void lcd_execute_command(lcd_data_t *lcd)
+{
+    // action should be only taken on a falling edge of the enable bit
+    if ((lcd->reg_prev.parts.e) && !(lcd->reg.parts.e)) {
+        bool display_updated = false;
+
+        if (lcd->reg.parts.rs) {
+            // RS = 1 => writing to data register
+
+            if (!lcd->reg.parts.rw) {
+                // RW = 0 => write operation
+
+                if (lcd->current_col < lcd->cols) {
+                    lcd->buffer[lcd->current_row * lcd->cols + lcd->current_col] = lcd->reg.parts.data;
+                    lcd->current_col++;
+                    display_updated = true;
+
+                    // automatically wrap to next line if needed
+                    if (lcd->current_col >= lcd->cols) {
+                        lcd->current_col = 0;
+                        lcd->current_row = (lcd->current_row + 1) % lcd->rows;
+                    }
+                }
+            }
+        } else {
+            // RS = 0 => writing to command register
+            if (!lcd->reg.parts.rw) {
+                // RW = 0 => write operation
+                switch (lcd->reg.parts.data) {
+                case LCD_CMD_CLEAR: /* clear display */
+                    memset(lcd->buffer, 0, lcd->rows * lcd->cols);
+
+                    lcd->current_row = 0;
+                    lcd->current_col = 0;
+                    display_updated = true;
+
+                    break;
+
+                case LCD_CMD_HOME: /* return home */
+                    lcd->current_row = 0;
+                    lcd->current_col = 0;
+
+                    break;
+
+                default:
+                    if (lcd->reg.parts.data & LCD_SET_CURSOR_CMD) {
+                        uint8_t addr = lcd->reg.parts.data & LCD_SET_CURSOR_MASK;
+
+                        lcd_set_cursor(lcd, addr);
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        if (display_updated) {
+            lcd_print(lcd);
+        }
+    }
+}
+
 static void lcd_write32(unsigned int procno, device_t *dev, ptr36_t addr, uint32_t val)
 {
     ASSERT(dev != NULL);
 
     lcd_data_t *data = (lcd_data_t *) dev->data;
-    bool display_updated = false;
 
     switch (addr - data->addr) {
     case REGISTER_DATA:
@@ -205,61 +272,8 @@ static void lcd_write32(unsigned int procno, device_t *dev, ptr36_t addr, uint32
         data->reg.parts.rw = value.parts.rw;
         data->reg.parts.e = value.parts.e;
 
-        // action should be only taken on a falling edge of the enable bit
-        if ((data->reg_prev.parts.e) && !(data->reg.parts.e)) {
-            if (data->reg.parts.rs) {
-                // RS = 1 => writing to data register
-                if (!data->reg.parts.rw) {
-                    // RW = 0 => write operation
+        lcd_execute_command(data);
 
-                    if (data->current_col < data->cols) {
-                        data->buffer[data->current_row * data->cols + data->current_col] = data->reg.parts.data;
-                        data->current_col++;
-                        display_updated = true;
-
-                        // automatically wrap to next line if needed
-                        if (data->current_col >= data->cols) {
-                            data->current_col = 0;
-                            data->current_row = (data->current_row + 1) % data->rows;
-                        }
-                    }
-                }
-            } else {
-                // RS = 0 => writing to command register
-                if (!data->reg.parts.rw) {
-                    // RW = 0 => write operation
-                    switch (data->reg.parts.data) {
-                    case 0x01: /* clear display */
-                        memset(data->buffer, 0, data->rows * data->cols);
-
-                        data->current_row = 0;
-                        data->current_col = 0;
-                        display_updated = true;
-
-                        break;
-
-                    case 0x02: /* return home */
-                        data->current_row = 0;
-                        data->current_col = 0;
-
-                        break;
-
-                    default:
-                        if ((data->reg.parts.data & 0x80) == 0x80) {
-                            uint8_t addr = data->reg.parts.data & 0x7F;
-
-                            lcd_set_cursor(data, addr);
-                        }
-
-                        break;
-                    }
-                }
-            }
-
-            if (display_updated) {
-                lcd_print(data);
-            }
-        }
         break;
 
     default:
